@@ -333,6 +333,11 @@ __device__ inline uint32_t duplicateToTilesTouched(
         return 0;
     }
 
+    // Below 1/255 effective alpha, same as render skip; avoids log(negative) -> NaN tile bounds
+    if (con_o.w <= (1.0f / 255.0f)) {
+        return 0;
+    }
+
     // Threshold: opacity * Gaussian = 1 / 255
     float t = 2.0f * log(con_o.w * 255.0f);
     t = mult * t; // beta in Compact Box
