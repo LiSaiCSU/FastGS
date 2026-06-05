@@ -34,6 +34,20 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    timestamp: float = 0.0   # normalized time in [0, 1] (4D extension)
+    frame_idx: int = 0       # integer frame index (4D extension)
+
+class TemporalPointCloud(NamedTuple):
+    """Point cloud carrying per-point temporal metadata for TD-FastGS.
+
+    Points are ordered static-first, then dynamic (frame-by-frame), matching the
+    concatenation order expected by GaussianModel.create_from_pcd_4d.
+    """
+    points: np.array      # (N, 3)
+    colors: np.array      # (N, 3) in [0, 1]
+    normals: np.array     # (N, 3)
+    timestamps: np.array  # (N,)   normalized birth time t_mu in [0, 1]
+    is_static: np.array   # (N,)   bool, True for background points
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -41,6 +55,8 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+    temporal_point_cloud: object = None  # TemporalPointCloud for 4D scenes, else None
+    n_frames: int = 1                    # number of temporal frames
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -254,7 +270,212 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+import re
+import glob
+
+def parse_frame_idx(name):
+    """Extract the integer frame index from an image name.
+
+    Looks for a `frame_<digits>` token first (the documented layout), then falls
+    back to the last run of digits in the name. Returns 0 if nothing is found.
+    """
+    base = os.path.basename(str(name))
+    m = re.search(r"frame[_-]?(\d+)", base, flags=re.IGNORECASE)
+    if m is not None:
+        return int(m.group(1))
+    digits = re.findall(r"\d+", base)
+    if digits:
+        return int(digits[-1])
+    return 0
+
+def _fetch_ply_xyz_rgb(path):
+    plydata = PlyData.read(path)
+    vertices = plydata['vertex']
+    positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+    try:
+        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    except (ValueError, KeyError):
+        colors = np.ones_like(positions) * 0.5
+    return positions, colors
+
+def load_temporal_point_cloud_pcd(scene_path, frame_to_t):
+    """Load static + per-frame dynamic point clouds for the multi-view-video layout.
+
+    Layout (flower300):
+        scene_path/static_points/*.ply           (e.g. pcd1.ply, t_mu=0)
+        scene_path/dynamic_points/pcd<N>.ply      (frame N, t_mu=frame_to_t[N])
+
+    Static points come first (t_mu=0, is_static=True), followed by dynamic points
+    for each frame in ascending frame order. `frame_to_t` maps an integer frame id
+    to its normalized timestamp (the same map used for the cameras), so a dynamic
+    Gaussian's birth time equals its source frame's camera timestamp exactly.
+    """
+    static_dir = os.path.join(scene_path, "static_points")
+    dyn_dir = os.path.join(scene_path, "dynamic_points")
+
+    pts_list, col_list, ts_list, static_list = [], [], [], []
+
+    if os.path.isdir(static_dir):
+        for spath in sorted(glob.glob(os.path.join(static_dir, "*.ply")),
+                            key=lambda p: parse_frame_idx(p)):
+            s_pts, s_col = _fetch_ply_xyz_rgb(spath)
+            if s_pts.shape[0] == 0:
+                continue
+            pts_list.append(s_pts)
+            col_list.append(s_col)
+            ts_list.append(np.zeros(s_pts.shape[0], dtype=np.float32))
+            static_list.append(np.ones(s_pts.shape[0], dtype=bool))
+
+    if os.path.isdir(dyn_dir):
+        frame_files = sorted(glob.glob(os.path.join(dyn_dir, "*.ply")),
+                             key=lambda p: parse_frame_idx(p))
+        for fpath in frame_files:
+            fidx = parse_frame_idx(fpath)
+            d_pts, d_col = _fetch_ply_xyz_rgb(fpath)
+            if d_pts.shape[0] == 0:
+                continue
+            t = float(frame_to_t.get(fidx, 0.0))
+            pts_list.append(d_pts)
+            col_list.append(d_col)
+            ts_list.append(np.full(d_pts.shape[0], t, dtype=np.float32))
+            static_list.append(np.zeros(d_pts.shape[0], dtype=bool))
+
+    if not pts_list:
+        return None
+
+    points = np.concatenate(pts_list, axis=0).astype(np.float32)
+    colors = np.concatenate(col_list, axis=0).astype(np.float32)
+    timestamps = np.concatenate(ts_list, axis=0).astype(np.float32)
+    is_static = np.concatenate(static_list, axis=0)
+    normals = np.zeros_like(points)
+    return TemporalPointCloud(points=points, colors=colors, normals=normals,
+                              timestamps=timestamps, is_static=is_static)
+
+def _read_colmap_calib(path):
+    """Read COLMAP camera calibration without opening any images.
+
+    Returns a list of dicts {uid, R, T, FovX, FovY, width, height, name} ordered
+    by image name. `name` is the COLMAP image NAME stem (here a camera id like
+    "1", "2", ...). Supports both binary and text COLMAP exports.
+    """
+    try:
+        cam_extrinsics = read_extrinsics_binary(os.path.join(path, "sparse/0", "images.bin"))
+        cam_intrinsics = read_intrinsics_binary(os.path.join(path, "sparse/0", "cameras.bin"))
+    except Exception:
+        cam_extrinsics = read_extrinsics_text(os.path.join(path, "sparse/0", "images.txt"))
+        cam_intrinsics = read_intrinsics_text(os.path.join(path, "sparse/0", "cameras.txt"))
+
+    cams = []
+    for key in cam_extrinsics:
+        extr = cam_extrinsics[key]
+        intr = cam_intrinsics[extr.camera_id]
+        height, width = intr.height, intr.width
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
+        if intr.model == "SIMPLE_PINHOLE":
+            fx = intr.params[0]
+            FovY = focal2fov(fx, height)
+            FovX = focal2fov(fx, width)
+        elif intr.model == "PINHOLE":
+            fx, fy = intr.params[0], intr.params[1]
+            FovY = focal2fov(fy, height)
+            FovX = focal2fov(fx, width)
+        else:
+            assert False, ("Colmap camera model not handled: only undistorted "
+                           "datasets (PINHOLE or SIMPLE_PINHOLE) supported!")
+        cams.append({"uid": intr.id, "R": R, "T": T, "FovX": FovX, "FovY": FovY,
+                     "width": width, "height": height,
+                     "name": os.path.basename(extr.name).split(".")[0]})
+    cams.sort(key=lambda c: c["name"])
+    return cams
+
+
+def readColmap4DSceneInfo(path, images, eval, n_frames=-1, llffhold=8):
+    """4DGS multi-view-video reader (flower300 layout).
+
+    `sparse/0` calibrates a fixed set of cameras (the COLMAP image names are CAMERA
+    ids, not frames). The actual frames live as folders under `images/<frame>/images/`,
+    each holding one image per camera. Training views are therefore the cross
+    product (camera x frame); a Camera is emitted per (camera, frame) pair with the
+    frame's normalized timestamp. Images are NOT opened here (lazy loading): the
+    CameraInfo carries `image=None` and the path, and dims come from the COLMAP
+    intrinsics. The decoupled static/dynamic .ply clouds provide 4D initialization.
+    """
+    reading_dir = "images" if images is None else images
+    images_root = os.path.join(path, reading_dir)
+
+    calib = _read_colmap_calib(path)
+
+    # Discover integer-named frame folders under images/.
+    frames = []
+    if os.path.isdir(images_root):
+        for entry in os.listdir(images_root):
+            if entry.isdigit() and os.path.isdir(os.path.join(images_root, entry)):
+                frames.append(int(entry))
+    frames.sort()
+    if not frames:
+        frames = [0]
+    fmin, fmax = frames[0], frames[-1]
+    span = float(fmax - fmin) if fmax > fmin else 1.0
+    frame_to_t = {f: (float(f - fmin) / span) for f in frames}
+
+    if n_frames is None or n_frames <= 0:
+        n_frames = len(frames)
+
+    # Cross product: one CameraInfo per (frame, camera), lazily loaded.
+    cam_infos = []
+    uid = 0
+    missing = 0
+    for f in frames:
+        frame_dir = os.path.join(images_root, str(f), "images")
+        t = frame_to_t[f]
+        for c in calib:
+            img_path = os.path.join(frame_dir, c["name"] + ".png")
+            if not os.path.exists(img_path):
+                missing += 1
+                continue
+            cam_infos.append(CameraInfo(
+                uid=uid, R=c["R"], T=c["T"], FovY=c["FovY"], FovX=c["FovX"],
+                image=None, image_path=img_path,
+                image_name="f{}_c{}".format(f, c["name"]),
+                width=c["width"], height=c["height"],
+                timestamp=t, frame_idx=f))
+            uid += 1
+    if missing:
+        print("[TD-FastGS] Warning: {} (camera, frame) images were missing and skipped.".format(missing))
+    print("[TD-FastGS] Built {} cameras across {} frames ({} calibrated cams).".format(
+        len(cam_infos), len(frames), len(calib)))
+
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    temporal_pcd = load_temporal_point_cloud_pcd(path, frame_to_t)
+    if temporal_pcd is not None:
+        pcd = BasicPointCloud(points=temporal_pcd.points,
+                              colors=temporal_pcd.colors,
+                              normals=temporal_pcd.normals)
+    else:
+        pcd = None
+    # The decoupled clouds are the only init source (points3D is empty here); no
+    # input.ply round-trip, so report no ply_path.
+    ply_path = None
+
+    return SceneInfo(point_cloud=pcd,
+                     train_cameras=train_cam_infos,
+                     test_cameras=test_cam_infos,
+                     nerf_normalization=nerf_normalization,
+                     ply_path=ply_path,
+                     temporal_point_cloud=temporal_pcd,
+                     n_frames=n_frames)
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Colmap4D": readColmap4DSceneInfo
 }

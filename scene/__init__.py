@@ -40,17 +40,33 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        # Detect a 4DGS dataset: forced via --force_4dgs, or auto-detected from the
+        # decoupled static/dynamic point-cloud layout described in prompt.md.
+        force_4dgs = getattr(args, "force_4dgs", False)
+        has_temporal_layout = os.path.isdir(os.path.join(args.source_path, "static_points")) or \
+                              os.path.isdir(os.path.join(args.source_path, "dynamic_points"))
+        self.is_4dgs = force_4dgs or has_temporal_layout
+
+        if self.is_4dgs:
+            print("[TD-FastGS] 4DGS dataset detected; using the temporal scene reader.")
+            n_frames = getattr(args, "n_frames", -1)
+            scene_info = sceneLoadTypeCallbacks["Colmap4D"](args.source_path, args.images,
+                                                            args.eval, n_frames=n_frames)
+            self.n_frames = scene_info.n_frames
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+            self.n_frames = 1
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+            self.n_frames = 1
         else:
             assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
-                dest_file.write(src_file.read())
+            if scene_info.ply_path is not None and os.path.exists(scene_info.ply_path):
+                with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+                    dest_file.write(src_file.read())
             json_cams = []
             camlist = []
             if scene_info.test_cameras:
@@ -79,6 +95,9 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
+        elif self.is_4dgs and scene_info.temporal_point_cloud is not None:
+            self.gaussians.create_from_pcd_4d(scene_info.temporal_point_cloud,
+                                              self.cameras_extent, self.n_frames)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 

@@ -44,7 +44,7 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
@@ -54,6 +54,10 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        # TD-FastGS 4D extension. When force_4dgs is True the scene loader always
+        # uses the 4DGS reader; otherwise it is auto-detected from the dataset layout.
+        self.force_4dgs = False
+        self.n_frames = -1   # number of temporal frames; -1 => infer from data
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -101,6 +105,22 @@ class OptimizationParams(ParamGroup):
 
         self.random_background = False
         self.optimizer_type = "default"
+
+        # ----- TD-FastGS 4D (temporal) parameters -----
+        self.velocity_lr = 0.0016          # learning rate for per-Gaussian velocity v
+        self.sigma_t_lr = 0.002            # learning rate for sigma_t_raw (life radius, log space)
+        self.lambda_velocity = 0.01        # weight of the velocity-smoothness regularizer (lambda_v)
+        self.velocity_smooth_pairs = 4096  # number of point-pairs sampled for L_smooth
+        self.tau_alive = 0.005             # causal pruning threshold on alpha'(t)
+        self.tau_d_static = 5.0            # densification (VCD) threshold for static points
+        self.tau_d_dynamic = 2.5           # densification (VCD) threshold for dynamic points
+        self.tau_p = 0.9                   # pruning (VCP) threshold
+        self.wt_densify_thresh = 0.2       # w_t active-window threshold used for densify/prune gating
+        self.wt_current_thresh = 0.5       # w_t "current frame" threshold for the gradient gate
+        self.static_only_until = 3000      # stage-1 boundary: sample only frame 0 before this
+        self.temporal_window_until = 10000 # stage-2 boundary: sliding-window sampling before this
+        self.temporal_window_size = 4      # sliding-window width (frames) in stage 2
+        self.lambda_scale_penalty = 0.0    # soft scale penalty weight for dynamic points (0 => off)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

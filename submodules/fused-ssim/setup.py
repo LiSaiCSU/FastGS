@@ -9,7 +9,8 @@ setup(
             name="fused_ssim_cuda",
             sources=[
             "ssim.cu",
-            "ext.cpp"])
+            "ext.cpp"],
+            extra_compile_args={"nvcc": ["-allow-unsupported-compiler"]})
         ],
     cmdclass={
         'build_ext': BuildExtension

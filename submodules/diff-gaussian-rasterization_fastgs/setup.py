@@ -27,7 +27,10 @@ setup(
             "cuda_rasterizer/adam.cu",
             "rasterize_points.cu",
             "ext.cpp"],
-            extra_compile_args={"nvcc": ["-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/")]})
+            extra_compile_args={"nvcc": [
+                    "-allow-unsupported-compiler",
+                    "-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/"),
+                ]})
         ],
     cmdclass={
         'build_ext': BuildExtension

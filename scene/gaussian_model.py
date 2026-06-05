@@ -10,6 +10,7 @@
 #
 
 import torch
+import math
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, identity_gate
 from torch import nn
@@ -53,7 +54,7 @@ class GaussianModel:
     def __init__(self, sh_degree, optimizer_type="default"):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -68,6 +69,19 @@ class GaussianModel:
         self.shoptimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+
+        # ----- TD-FastGS temporal attributes -----
+        # _t_mu and is_static are resident (NOT in the optimizer); _sigma_t_raw and
+        # _velocity are optimized but the static rows are hard-zeroed every step.
+        self.is_4d = False                 # toggled on by create_from_pcd_4d / load_ply
+        self._t_mu = torch.empty(0)        # (N,)  birth time, frozen
+        self._sigma_t_raw = torch.empty(0) # (N,)  life radius (log space), learnable
+        self._velocity = torch.empty(0)    # (N,3) motion velocity, learnable (dynamic)
+        self.is_static = torch.empty(0, dtype=torch.bool)  # (N,) identity mask
+        self.tau_alive = 0.005             # causal pruning threshold on alpha'(t)
+        self.n_frames = 1                  # number of temporal frames
+        self._current_wt_mean = torch.empty(0)  # cached batch-mean w_t for ADC gating
+
         self.setup_functions()
 
     def capture(self, optimizer_type):
@@ -189,6 +203,83 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def _init_temporal_static(self, N):
+        """Default temporal attributes for a fully-static model (3D fallback)."""
+        self._t_mu = torch.zeros(N, device="cuda")
+        self._sigma_t_raw = nn.Parameter(
+            torch.full((N,), math.log(1000.0), device="cuda").requires_grad_(True))
+        self._velocity = nn.Parameter(
+            torch.zeros((N, 3), device="cuda").requires_grad_(True))
+        self.is_static = torch.ones(N, dtype=torch.bool, device="cuda")
+
+    def compute_temporal_weight(self, t):
+        """Per-Gaussian temporal activity weight w_t^(i)(t), shape (N,).
+
+        w_t = exp(-(t - t_mu)^2 / (2 sigma_t^2 + eps)); static points are pinned
+        to 1.0. Must NOT be wrapped in torch.no_grad() when its gradient w.r.t.
+        sigma_t_raw is needed (rendering / VCD score)."""
+        sigma_t = torch.exp(self._sigma_t_raw)          # (N,)
+        dt = t - self._t_mu                             # (N,)
+        w_t = torch.exp(-dt ** 2 / (2 * sigma_t ** 2 + 1e-8))
+        # Pin static points to 1.0 without breaking the graph for dynamic points.
+        w_t = torch.where(self.is_static, torch.ones_like(w_t), w_t)
+        return w_t
+
+    def create_from_pcd_4d(self, tpcd, spatial_lr_scale, n_frames):
+        """Initialize Gaussians from a TemporalPointCloud (static-first ordering).
+
+        Static points: t_mu=0, sigma_t=1000 (full-time visible), v=0, frozen.
+        Dynamic points: t_mu=birth timestamp, sigma_t covering ~2.5 frames, v=0.
+        """
+        self.is_4d = True
+        self.n_frames = max(int(n_frames), 1)
+        self.spatial_lr_scale = spatial_lr_scale
+
+        points = np.asarray(tpcd.points)
+        colors = np.asarray(tpcd.colors)
+        timestamps = np.asarray(tpcd.timestamps)
+        is_static_np = np.asarray(tpcd.is_static)
+
+        fused_point_cloud = torch.tensor(points).float().cuda()
+        fused_color = RGB2SH(torch.tensor(colors).float().cuda())
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        N = fused_point_cloud.shape[0]
+        print(f"[TD-FastGS] points at init: {N} "
+              f"(static={int(is_static_np.sum())}, dynamic={int((~is_static_np).sum())})")
+
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        rots = torch.zeros((N, 4), device="cuda")
+        rots[:, 0] = 1
+        opacities = self.inverse_opacity_activation(0.1 * torch.ones((N, 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((N), device="cuda")
+
+        # Temporal attributes.
+        is_static = torch.tensor(is_static_np, dtype=torch.bool, device="cuda")
+        t_mu = torch.tensor(timestamps, dtype=torch.float, device="cuda")
+        # Static points: t_mu pinned to 0.
+        t_mu = torch.where(is_static, torch.zeros_like(t_mu), t_mu)
+
+        sigma_t_raw = torch.empty(N, device="cuda")
+        sigma_t_raw[is_static] = math.log(1000.0)
+        sigma_t_raw[~is_static] = math.log(2.5 / max(self.n_frames, 1))
+        velocity = torch.zeros((N, 3), device="cuda")
+
+        self.is_static = is_static
+        self._t_mu = t_mu
+        self._sigma_t_raw = nn.Parameter(sigma_t_raw.requires_grad_(True))
+        self._velocity = nn.Parameter(velocity.requires_grad_(True))
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -203,6 +294,16 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
         sh_l = [{'params': [self._features_rest], 'lr': training_args.highfeature_lr / 20.0, "name": "f_rest"}]
+
+        # Temporal parameters share the main optimizer so prune/clone/cat keep them
+        # in sync with the geometry tensors (writeback is keyed on group["name"]).
+        if self.is_4d:
+            if not isinstance(self._sigma_t_raw, nn.Parameter):
+                self._init_temporal_static(self.get_xyz.shape[0])
+            l.append({'params': [self._velocity],
+                      'lr': getattr(training_args, "velocity_lr", 0.0016), "name": "velocity"})
+            l.append({'params': [self._sigma_t_raw],
+                      'lr': getattr(training_args, "sigma_t_lr", 0.002), "name": "sigma_t_raw"})
 
         if self.optimizer_type == "default":
             self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -255,6 +356,8 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        if self.is_4d:
+            l += ['t_mu', 'sigma_t_raw', 'vel_x', 'vel_y', 'vel_z', 'is_static']
         return l
 
     def save_ply(self, path):
@@ -271,7 +374,15 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        if self.is_4d:
+            t_mu = self._t_mu.detach().cpu().numpy()[:, None]
+            sigma_t_raw = self._sigma_t_raw.detach().cpu().numpy()[:, None]
+            velocity = self._velocity.detach().cpu().numpy()
+            is_static = self.is_static.detach().cpu().numpy().astype(np.float32)[:, None]
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation,
+                                         t_mu, sigma_t_raw, velocity, is_static), axis=1)
+        else:
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -280,6 +391,64 @@ class GaussianModel:
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
+
+    def reset_opacity_decoupled(self, reset_value=0.01):
+        """Decoupled opacity reset (TD-FastGS): only static points are reset; dynamic
+        points keep their opacity to protect foreground temporal state. Adam state is
+        synced via replace_tensor_to_optimizer."""
+        if not self.is_4d:
+            return self.reset_opacity()
+        with torch.no_grad():
+            static_mask = self.is_static
+            target = self.inverse_opacity_activation(
+                torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * reset_value))
+            opacities_new = self._opacity.clone()
+            opacities_new[static_mask] = target[static_mask]
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
+
+    def enforce_static_constraints(self):
+        """Hard pull-back for static points to counter Adam momentum residue.
+        Call immediately after optimizer.step(). Zeros velocity, pins sigma_t_raw to
+        log(1000) and t_mu to 0, and clears the matching Adam moments."""
+        if not self.is_4d:
+            return
+        with torch.no_grad():
+            static_mask = self.is_static
+            if static_mask.sum() == 0:
+                return
+            self._velocity.data[static_mask] = 0.0
+            self._sigma_t_raw.data[static_mask] = math.log(1000.0)
+            self._t_mu[static_mask] = 0.0
+            for group in self.optimizer.param_groups:
+                if group["name"] in ("velocity", "sigma_t_raw"):
+                    p = group["params"][0]
+                    state = self.optimizer.state.get(p, None)
+                    if state is not None and "exp_avg" in state:
+                        state["exp_avg"][static_mask] = 0.0
+                        state["exp_avg_sq"][static_mask] = 0.0
+
+    def apply_gradient_gating(self, t_current, wt_current_thresh=0.5):
+        """Three-level gradient gate (call after backward(), before step()):
+          - static points: velocity & sigma_t_raw grads zeroed;
+          - dynamic & current (w_t > thresh): all grads pass;
+          - dynamic & other frame: geometry grads zeroed, opacity/velocity/sigma_t pass."""
+        if not self.is_4d:
+            return
+        with torch.no_grad():
+            w_t = self.compute_temporal_weight(t_current).detach()
+            is_static = self.is_static
+            is_dynamic_other = (~is_static) & (w_t <= wt_current_thresh)
+
+            for name in ("_velocity", "_sigma_t_raw"):
+                p = getattr(self, name)
+                if p.grad is not None:
+                    p.grad[is_static] = 0.0
+
+            for name in ("_xyz", "_features_dc", "_features_rest", "_scaling", "_rotation"):
+                p = getattr(self, name)
+                if p.grad is not None:
+                    p.grad[is_dynamic_other] = 0.0
 
     def load_ply(self, path):
         plydata = PlyData.read(path)
@@ -321,6 +490,25 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+
+        # Restore temporal attributes if present; otherwise degrade to static mode.
+        prop_names = [p.name for p in plydata.elements[0].properties]
+        N = xyz.shape[0]
+        if "t_mu" in prop_names and "sigma_t_raw" in prop_names and "vel_x" in prop_names:
+            self.is_4d = True
+            t_mu = np.asarray(plydata.elements[0]["t_mu"])
+            sigma_t_raw = np.asarray(plydata.elements[0]["sigma_t_raw"])
+            vel = np.stack((np.asarray(plydata.elements[0]["vel_x"]),
+                            np.asarray(plydata.elements[0]["vel_y"]),
+                            np.asarray(plydata.elements[0]["vel_z"])), axis=1)
+            if "is_static" in prop_names:
+                is_static = np.asarray(plydata.elements[0]["is_static"]) > 0.5
+            else:
+                is_static = np.zeros(N, dtype=bool)
+            self._t_mu = torch.tensor(t_mu, dtype=torch.float, device="cuda")
+            self._sigma_t_raw = nn.Parameter(torch.tensor(sigma_t_raw, dtype=torch.float, device="cuda").requires_grad_(True))
+            self._velocity = nn.Parameter(torch.tensor(vel, dtype=torch.float, device="cuda").requires_grad_(True))
+            self.is_static = torch.tensor(is_static, dtype=torch.bool, device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -372,6 +560,13 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        if self.is_4d:
+            self._velocity = optimizable_tensors["velocity"]
+            self._sigma_t_raw = optimizable_tensors["sigma_t_raw"]
+            # Resident (non-optimizer) temporal tensors.
+            self._t_mu = self._t_mu[valid_points_mask]
+            self.is_static = self.is_static[valid_points_mask]
+
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
 
@@ -406,13 +601,18 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,
+                              new_velocity=None, new_sigma_t_raw=None, new_t_mu=None, new_is_static=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation}
+
+        if self.is_4d:
+            d["velocity"] = new_velocity
+            d["sigma_t_raw"] = new_sigma_t_raw
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -421,6 +621,13 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        if self.is_4d:
+            self._velocity = optimizable_tensors["velocity"]
+            self._sigma_t_raw = optimizable_tensors["sigma_t_raw"]
+            # Resident temporal tensors grow by concatenation.
+            self._t_mu = torch.cat((self._t_mu, new_t_mu), dim=0)
+            self.is_static = torch.cat((self.is_static, new_is_static), dim=0)
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -447,7 +654,18 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        if self.is_4d:
+            # Children inherit temporal attributes verbatim (position is perturbed,
+            # temporal parameters are copied). Static children stay static.
+            new_velocity = self._velocity[selected_pts_mask].repeat(N, 1)
+            new_sigma_t_raw = self._sigma_t_raw[selected_pts_mask].repeat(N)
+            new_t_mu = self._t_mu[selected_pts_mask].repeat(N)
+            new_is_static = self.is_static[selected_pts_mask].repeat(N)
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii,
+                                       new_velocity=new_velocity, new_sigma_t_raw=new_sigma_t_raw,
+                                       new_t_mu=new_t_mu, new_is_static=new_is_static)
+        else:
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -463,7 +681,16 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        if self.is_4d:
+            new_velocity = self._velocity[selected_pts_mask]
+            new_sigma_t_raw = self._sigma_t_raw[selected_pts_mask]
+            new_t_mu = self._t_mu[selected_pts_mask]
+            new_is_static = self.is_static[selected_pts_mask]
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,
+                                       new_velocity=new_velocity, new_sigma_t_raw=new_sigma_t_raw,
+                                       new_t_mu=new_t_mu, new_is_static=new_is_static)
+        else:
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
     def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None):
         
@@ -534,7 +761,104 @@ class GaussianModel:
         """Final-stage pruning: remove Gaussians based on opacity and multi-view consistency.
         In the final stage we remove Gaussians that have low opacity or that are flagged by
         our multi-view reconstruction consistency metric (provided as `pruning_score`)."""
-        prune_mask = (self.get_opacity < min_opacity).squeeze() 
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
         scores_mask = pruning_score > 0.9
         final_prune = torch.logical_or(prune_mask, scores_mask)
+        self.prune_points(final_prune)
+
+    # ===================== TD-FastGS temporal ADC =====================
+
+    def set_current_wt_mean(self, timestamps):
+        """Cache the per-Gaussian mean temporal weight over a set of view timestamps.
+        Used by the densify/prune gating to decide which dynamic points are 'active'
+        in the current densification batch. Computed without grad."""
+        with torch.no_grad():
+            if len(timestamps) == 0:
+                self._current_wt_mean = torch.ones(self.get_xyz.shape[0], device="cuda")
+                return
+            acc = torch.zeros(self.get_xyz.shape[0], device="cuda")
+            for t in timestamps:
+                acc += self.compute_temporal_weight(float(t))
+            self._current_wt_mean = acc / len(timestamps)
+
+    def densify_and_prune_4d(self, max_screen_size, min_opacity, extent, radii, args,
+                             importance_score=None, pruning_score=None):
+        """Temporal-aware ADC. Mirrors densify_and_prune_fastgs but:
+          - uses per-point densification thresholds (static=tau_d_static,
+            dynamic=tau_d_dynamic) and gates dynamic densify on the active window;
+          - prunes static points by VCP and dynamic points by credit-assigned VCP
+            restricted to their active window (w_t > wt_densify_thresh)."""
+        grad_vars = self.xyz_gradient_accum / self.denom
+        grad_vars[grad_vars.isnan()] = 0.0
+        self.tmp_radii = radii
+
+        grads_abs = self.xyz_gradient_accum_abs / self.denom
+        grads_abs[grads_abs.isnan()] = 0.0
+
+        grad_qualifiers = torch.norm(grad_vars, dim=-1) >= args.grad_thresh
+        grad_qualifiers_abs = torch.norm(grads_abs, dim=-1) >= args.grad_abs_thresh
+        clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= args.dense * extent
+        split_qualifiers = torch.max(self.get_scaling, dim=1).values > args.dense * extent
+
+        all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
+        all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
+
+        # Per-point densification threshold (dynamic points use a lower tau_d).
+        tau_d = torch.where(self.is_static,
+                            torch.full_like(self._current_wt_mean, args.tau_d_static),
+                            torch.full_like(self._current_wt_mean, args.tau_d_dynamic))
+        metric_mask = importance_score.squeeze() > tau_d
+
+        # Dynamic points may only densify inside their active window.
+        dynamic_active = (~self.is_static) & (self._current_wt_mean > args.wt_densify_thresh)
+        densify_allowed = self.is_static | dynamic_active
+        metric_mask = metric_mask & densify_allowed
+
+        self.densify_and_clone_fastgs(metric_mask, all_clones)
+        self.densify_and_split_fastgs(metric_mask, all_splits)
+
+        # ---- pruning ----
+        # Clone/split appended new points at the end, so vcp / wt_mean (computed at
+        # the pre-densification size) must be padded to the current size. New points
+        # get score 0 (eligible for opacity pruning only, never VCP pruning).
+        N_now = self.get_xyz.shape[0]
+        vcp = pruning_score.squeeze()
+        if vcp.shape[0] < N_now:
+            pad = torch.zeros(N_now - vcp.shape[0], device=vcp.device, dtype=vcp.dtype)
+            vcp = torch.cat((vcp, pad), dim=0)
+        wt_mean = self._current_wt_mean
+        if wt_mean.shape[0] < N_now:
+            pad = torch.zeros(N_now - wt_mean.shape[0], device=wt_mean.device, dtype=wt_mean.dtype)
+            wt_mean = torch.cat((wt_mean, pad), dim=0)
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        # VCP score prune: static always eligible; dynamic only inside active window.
+        static_prune = self.is_static & (vcp > args.tau_p)
+        dyn_active_now = (~self.is_static) & (wt_mean > args.wt_densify_thresh)
+        dynamic_prune = dyn_active_now & (vcp > args.tau_p)
+        prune_mask = prune_mask | static_prune | dynamic_prune
+
+        self.prune_points(prune_mask)
+
+        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.8))
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
+        self.tmp_radii = None
+        torch.cuda.empty_cache()
+
+    def final_prune_4d(self, min_opacity, pruning_score=None, args=None):
+        """Final-stage temporal pruning. Like final_prune_fastgs, but dynamic points
+        are protected outside their active window (credit assignment)."""
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        vcp = pruning_score.squeeze()
+        wt_thresh = args.wt_densify_thresh if args is not None else 0.2
+        static_prune = self.is_static & (vcp > 0.9)
+        dyn_active = (~self.is_static) & (self._current_wt_mean > wt_thresh)
+        dynamic_prune = dyn_active & (vcp > 0.9)
+        final_prune = prune_mask | static_prune | dynamic_prune
         self.prune_points(final_prune)

@@ -11,12 +11,12 @@
 
 import torch
 import numpy as np
-import os, random, time
+import os, random, time, math
 from random import randint
 from lpipsPyTorch import lpips
 from utils.loss_utils import l1_loss
 from fused_ssim import fused_ssim as fast_ssim
-from gaussian_renderer import render_fastgs, network_gui_ws
+from gaussian_renderer import render_fastgs, render_4d, network_gui_ws
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -31,7 +31,9 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
+from utils.fast_utils import (compute_gaussian_score_fastgs, sampling_cameras,
+                              compute_gaussian_score_fastgs_4d, sample_camera_4d,
+                              sample_views_for_vcd_vcp, compute_velocity_smoothness_loss)
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
@@ -39,6 +41,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+
+    # Dispatch to the temporal training loop for 4DGS datasets.
+    if getattr(scene, "is_4dgs", False):
+        return training_4d(dataset, opt, pipe, testing_iterations, saving_iterations,
+                           checkpoint_iterations, checkpoint, debug_from, websockets,
+                           tb_writer=tb_writer, gaussians=gaussians, scene=scene)
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -175,8 +184,156 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # scene.save(iteration)
     print(f"Gaussian number: {gaussians._xyz.shape[0]}")
     print(f"Training time: {total_time}")
-    
-def prepare_output_and_logger(args):    
+
+
+def training_4d(dataset, opt, pipe, testing_iterations, saving_iterations,
+                checkpoint_iterations, checkpoint, debug_from, websockets,
+                tb_writer=None, gaussians=None, scene=None):
+    """TD-FastGS temporal training loop.
+
+    Differences from the 3D loop:
+      - renders through render_4d at each camera's timestamp;
+      - 3-stage temporal camera sampling;
+      - velocity-smoothness regularizer added to the loss;
+      - three-level gradient gate after backward(), before step();
+      - static hard pull-back after step();
+      - decoupled (static-only) opacity reset;
+      - temporal-aware VCD/VCP densification and pruning.
+    """
+    first_iter = 0
+    gaussians.training_setup(opt)
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
+
+    n_frames = getattr(scene, "n_frames", 1)
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
+    total_time = 0.0
+
+    train_cameras = scene.getTrainCameras().copy()
+
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress (4D)")
+    first_iter += 1
+    bg = torch.rand((3), device="cuda") if opt.random_background else background
+
+    for iteration in range(first_iter, opt.iterations + 1):
+        iter_start.record()
+        gaussians.update_learning_rate(iteration)
+        if iteration % 1000 == 0:
+            gaussians.oneupSHdegree()
+
+        # 3-stage temporal camera sampling.
+        viewpoint_cam = sample_camera_4d(train_cameras, iteration, n_frames, opt)
+
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+
+        render_pkg = render_4d(viewpoint_cam, gaussians, pipe, bg, opt.mult)
+        image = render_pkg["render"]
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        radii = render_pkg["radii"]
+
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image)
+        ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        # Velocity-smoothness regularizer over dynamic points.
+        if opt.lambda_velocity > 0:
+            loss = loss + opt.lambda_velocity * compute_velocity_smoothness_loss(
+                gaussians, opt.velocity_smooth_pairs)
+
+        # Optional soft scale penalty for dynamic points.
+        if opt.lambda_scale_penalty > 0:
+            scale_limit = math.log(0.05 * scene.cameras_extent + 1e-8)
+            dyn = ~gaussians.is_static
+            if dyn.any():
+                excess = (gaussians._scaling[dyn] - scale_limit).clamp(min=0)
+                loss = loss + opt.lambda_scale_penalty * excess.pow(2).mean()
+
+        loss.backward()
+
+        # Three-level gradient gate (after backward, before step).
+        gaussians.apply_gradient_gating(viewpoint_cam.timestamp, opt.wt_current_thresh)
+
+        iter_end.record()
+
+        with torch.no_grad():
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.update(10)
+            if iteration == opt.iterations:
+                progress_bar.close()
+
+            if iteration in saving_iterations:
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration)
+
+            _training_4d_densify(iteration, opt, pipe, bg, dataset, scene,
+                                 gaussians, train_cameras, n_frames,
+                                 viewspace_point_tensor, visibility_filter, radii)
+
+            # Optimization step + static hard pull-back.
+            if iteration < opt.iterations:
+                if opt.optimizer_type == "default":
+                    gaussians.optimizer_step(iteration)
+                elif opt.optimizer_type == "sparse_adam":
+                    visible = radii > 0
+                    gaussians.optimizer.step(visible, radii.shape[0])
+                    gaussians.optimizer.zero_grad(set_to_none=True)
+                gaussians.enforce_static_constraints()
+
+            torch.cuda.synchronize()
+            total_time += iter_start.elapsed_time(iter_end) / 1e3
+
+    print(f"[TD-FastGS] Gaussian number: {gaussians._xyz.shape[0]}")
+    print(f"[TD-FastGS] Training time: {total_time}")
+
+
+def _training_4d_densify(iteration, opt, pipe, bg, dataset, scene, gaussians,
+                         train_cameras, n_frames, viewspace_point_tensor,
+                         visibility_filter, radii):
+    """Densification / pruning sub-step for the 4D loop (temporal VCD/VCP)."""
+    if iteration < opt.densify_until_iter:
+        gaussians.max_radii2D[visibility_filter] = torch.max(
+            gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+        gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+        if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+            size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+            camlist = sample_views_for_vcd_vcp(train_cameras, 10, iteration, opt)
+            timestamps = [c.timestamp for c in camlist]
+            gaussians.set_current_wt_mean(timestamps)
+            importance_score, pruning_score = compute_gaussian_score_fastgs_4d(
+                camlist, gaussians, pipe, bg, opt, render_4d, DENSIFY=True)
+            gaussians.densify_and_prune_4d(
+                max_screen_size=size_threshold, min_opacity=0.005,
+                extent=scene.cameras_extent, radii=radii, args=opt,
+                importance_score=importance_score, pruning_score=pruning_score)
+
+        # Decoupled opacity reset: static points only.
+        if iteration % opt.opacity_reset_interval == 0 or \
+           (dataset.white_background and iteration == opt.densify_from_iter):
+            gaussians.reset_opacity_decoupled()
+
+    # Post-densification temporal pruning every 3k iters in [15k, 30k).
+    if iteration % 3000 == 0 and 15000 < iteration < 30000:
+        camlist = sample_views_for_vcd_vcp(train_cameras, 10, iteration, opt)
+        timestamps = [c.timestamp for c in camlist]
+        gaussians.set_current_wt_mean(timestamps)
+        _, pruning_score = compute_gaussian_score_fastgs_4d(
+            camlist, gaussians, pipe, bg, opt, render_4d, DENSIFY=False)
+        gaussians.final_prune_4d(min_opacity=0.1, pruning_score=pruning_score, args=opt)
+
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')

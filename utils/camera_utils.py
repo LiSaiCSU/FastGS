@@ -16,27 +16,49 @@ from utils.graphics_utils import fov2focal
 
 WARNED = False
 
-def loadCam(args, id, cam_info, resolution_scale):
-    orig_w, orig_h = cam_info.image.size
+def _compute_resolution(args, orig_w, orig_h, resolution_scale):
+    """Resolve the target (W, H) for an image given the CLI resolution policy.
 
+    Shared by the eager and lazy loading paths so they downscale identically.
+    """
     if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
-        if args.resolution == -1:
-            if orig_w > 1600:
-                global WARNED
-                if not WARNED:
-                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
-                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
-                    WARNED = True
-                global_down = orig_w / 1600
-            else:
-                global_down = 1
+        return (round(orig_w / (resolution_scale * args.resolution)),
+                round(orig_h / (resolution_scale * args.resolution)))
+    # type that converts to float
+    if args.resolution == -1:
+        if orig_w > 1600:
+            global WARNED
+            if not WARNED:
+                print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
+                    "If this is not desired, please explicitly specify '--resolution/-r' as 1")
+                WARNED = True
+            global_down = orig_w / 1600
         else:
-            global_down = orig_w / args.resolution
+            global_down = 1
+    else:
+        global_down = orig_w / args.resolution
 
-        scale = float(global_down) * float(resolution_scale)
-        resolution = (int(orig_w / scale), int(orig_h / scale))
+    scale = float(global_down) * float(resolution_scale)
+    return (int(orig_w / scale), int(orig_h / scale))
+
+
+def loadCam(args, id, cam_info, resolution_scale):
+    # Lazy path: 4D multi-view-video cameras carry no decoded image. Compute the
+    # target resolution from the COLMAP intrinsic dims and defer disk decoding to
+    # Camera.original_image (bounded LRU cache).
+    if getattr(cam_info, "image", None) is None:
+        resolution = _compute_resolution(args, cam_info.width, cam_info.height, resolution_scale)
+        return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                      FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                      image=None, gt_alpha_mask=None,
+                      image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                      timestamp=getattr(cam_info, "timestamp", 0.0),
+                      frame_idx=getattr(cam_info, "frame_idx", 0),
+                      image_path=cam_info.image_path, resolution=resolution,
+                      gt_width=resolution[0], gt_height=resolution[1])
+
+    orig_w, orig_h = cam_info.image.size
+    resolution = _compute_resolution(args, orig_w, orig_h, resolution_scale)
 
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
 
@@ -46,10 +68,12 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  timestamp=getattr(cam_info, "timestamp", 0.0),
+                  frame_idx=getattr(cam_info, "frame_idx", 0))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
