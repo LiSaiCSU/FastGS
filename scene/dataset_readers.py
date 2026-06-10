@@ -48,6 +48,7 @@ class TemporalPointCloud(NamedTuple):
     normals: np.array     # (N, 3)
     timestamps: np.array  # (N,)   normalized birth time t_mu in [0, 1]
     is_static: np.array   # (N,)   bool, True for background points
+    velocities: np.array = None  # (N, 3) flow-estimated initial velocity, None → zero-init
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -298,10 +299,10 @@ def _fetch_ply_xyz_rgb(path):
         colors = np.ones_like(positions) * 0.5
     return positions, colors
 
-def load_temporal_point_cloud_pcd(scene_path, frame_to_t):
+def load_temporal_point_cloud_pcd(scene_path, frame_to_t, flows_dir="flows"):
     """Load static + per-frame dynamic point clouds for the multi-view-video layout.
 
-    Layout (flower300):
+    Layout (flower300 / two):
         scene_path/static_points/*.ply           (e.g. pcd1.ply, t_mu=0)
         scene_path/dynamic_points/pcd<N>.ply      (frame N, t_mu=frame_to_t[N])
 
@@ -309,11 +310,16 @@ def load_temporal_point_cloud_pcd(scene_path, frame_to_t):
     for each frame in ascending frame order. `frame_to_t` maps an integer frame id
     to its normalized timestamp (the same map used for the cameras), so a dynamic
     Gaussian's birth time equals its source frame's camera timestamp exactly.
+
+    If scene_path/flows_dir exists, 3D velocities are estimated from optical flow
+    and stored in the returned TemporalPointCloud.velocities field (static=0).
     """
     static_dir = os.path.join(scene_path, "static_points")
     dyn_dir = os.path.join(scene_path, "dynamic_points")
 
     pts_list, col_list, ts_list, static_list = [], [], [], []
+    # Track per dynamic point which frame it belongs to (for flow estimation).
+    frame_id_list = []
 
     if os.path.isdir(static_dir):
         for spath in sorted(glob.glob(os.path.join(static_dir, "*.ply")),
@@ -325,6 +331,7 @@ def load_temporal_point_cloud_pcd(scene_path, frame_to_t):
             col_list.append(s_col)
             ts_list.append(np.zeros(s_pts.shape[0], dtype=np.float32))
             static_list.append(np.ones(s_pts.shape[0], dtype=bool))
+            frame_id_list.append(np.full(s_pts.shape[0], -1, dtype=np.int32))
 
     if os.path.isdir(dyn_dir):
         frame_files = sorted(glob.glob(os.path.join(dyn_dir, "*.ply")),
@@ -339,6 +346,7 @@ def load_temporal_point_cloud_pcd(scene_path, frame_to_t):
             col_list.append(d_col)
             ts_list.append(np.full(d_pts.shape[0], t, dtype=np.float32))
             static_list.append(np.zeros(d_pts.shape[0], dtype=bool))
+            frame_id_list.append(np.full(d_pts.shape[0], fidx, dtype=np.int32))
 
     if not pts_list:
         return None
@@ -347,9 +355,217 @@ def load_temporal_point_cloud_pcd(scene_path, frame_to_t):
     colors = np.concatenate(col_list, axis=0).astype(np.float32)
     timestamps = np.concatenate(ts_list, axis=0).astype(np.float32)
     is_static = np.concatenate(static_list, axis=0)
+    frame_ids_all = np.concatenate(frame_id_list, axis=0)
     normals = np.zeros_like(points)
+
+    # Estimate velocities from optical flow if the flows directory exists.
+    velocities = None
+    flows_root = os.path.join(scene_path, flows_dir)
+    if os.path.isdir(flows_root):
+        dyn_mask = ~is_static
+        if dyn_mask.any():
+            print(f"[flow-vel] Estimating initial velocities from optical flow …")
+            vel_dyn = load_flow_velocities(
+                scene_path=scene_path,
+                points_world=points[dyn_mask],
+                frame_ids=frame_ids_all[dyn_mask],
+                frame_to_t=frame_to_t,
+                flows_dir=flows_dir,
+            )
+            velocities = np.zeros_like(points)
+            velocities[dyn_mask] = vel_dyn
+            v_mag = np.linalg.norm(vel_dyn, axis=1)
+            print(f"[flow-vel] velocity magnitude: mean={v_mag.mean():.4f}  "
+                  f"p50={np.median(v_mag):.4f}  p95={np.percentile(v_mag,95):.4f}")
+
     return TemporalPointCloud(points=points, colors=colors, normals=normals,
-                              timestamps=timestamps, is_static=is_static)
+                              timestamps=timestamps, is_static=is_static,
+                              velocities=velocities)
+
+def _read_colmap_calib_full(path):
+    """Like _read_colmap_calib but also returns raw intrinsic params (fx,fy,cx,cy)."""
+    try:
+        cam_extrinsics = read_extrinsics_binary(os.path.join(path, "sparse/0", "images.bin"))
+        cam_intrinsics = read_intrinsics_binary(os.path.join(path, "sparse/0", "cameras.bin"))
+    except Exception:
+        cam_extrinsics = read_extrinsics_text(os.path.join(path, "sparse/0", "images.txt"))
+        cam_intrinsics = read_intrinsics_text(os.path.join(path, "sparse/0", "cameras.txt"))
+
+    cams = {}  # keyed by image name stem
+    for key in cam_extrinsics:
+        extr = cam_extrinsics[key]
+        intr = cam_intrinsics[extr.camera_id]
+        height, width = intr.height, intr.width
+        R = np.transpose(qvec2rotmat(extr.qvec))   # world←cam rotation
+        T = np.array(extr.tvec)                     # world-to-cam translation
+        if intr.model == "SIMPLE_PINHOLE":
+            fx = fy = intr.params[0]
+            cx, cy = intr.params[1], intr.params[2]
+        elif intr.model == "PINHOLE":
+            fx, fy = intr.params[0], intr.params[1]
+            cx, cy = intr.params[2], intr.params[3]
+        else:
+            continue  # skip unsupported models
+        name = os.path.basename(extr.name).split(".")[0]
+        cams[name] = {"R": R, "T": T, "fx": fx, "fy": fy,
+                      "cx": cx, "cy": cy, "width": width, "height": height}
+    return cams
+
+
+def load_flow_velocities(scene_path, points_world, frame_ids, frame_to_t, flows_dir="flows"):
+    """Estimate per-point 3D velocity from optical flow for each dynamic frame.
+
+    For each dynamic point at frame f the function:
+      1. Projects the point into every camera that has a flow file for frame f.
+      2. Reads flow(u,v) at that pixel (bilinear); adds the displacement to get
+         the pixel position at frame f+1.
+      3. Un-projects both pixel positions at depth=1 into camera-space rays, takes
+         the difference as a direction, converts to world space and normalises by
+         the frame interval in normalised time (Δt).
+      4. Averages the estimates from all cameras that could see the point.
+
+    Returns float32 array (N_dynamic, 3). Points whose frame has no flow (last frame)
+    or that project outside all cameras get velocity=0.
+
+    Args:
+        scene_path:    dataset root
+        points_world:  (N, 3) 3-D positions of *dynamic* points only, in world space
+        frame_ids:     (N,)   integer frame index for each point
+        frame_to_t:    dict  frame_int → normalised timestamp
+        flows_dir:     relative path inside scene_path to flow folder
+    """
+    calib = _read_colmap_calib_full(scene_path)
+    if not calib:
+        return np.zeros((len(points_world), 3), dtype=np.float32)
+
+    flows_root = os.path.join(scene_path, flows_dir)
+    N = len(points_world)
+    velocities = np.zeros((N, 3), dtype=np.float32)
+
+    unique_frames = np.unique(frame_ids)
+    sorted_frames = sorted(frame_to_t.keys())
+    frame_idx_map = {f: i for i, f in enumerate(sorted_frames)}
+
+    for f in unique_frames:
+        frame_flow_dir = os.path.join(flows_root, str(f))
+        if not os.path.isdir(frame_flow_dir):
+            continue
+
+        # Next frame for Δt
+        fi = frame_idx_map.get(int(f))
+        if fi is None or fi + 1 >= len(sorted_frames):
+            continue
+        f_next = sorted_frames[fi + 1]
+        delta_t = frame_to_t[f_next] - frame_to_t[f]
+        if abs(delta_t) < 1e-8:
+            continue
+
+        mask = (frame_ids == f)
+        pts = points_world[mask]   # (M, 3)
+        M = pts.shape[0]
+        vel_sum = np.zeros((M, 3), dtype=np.float64)
+        vel_cnt = np.zeros(M, dtype=np.float32)
+
+        for cam_name, c in calib.items():
+            flow_path = os.path.join(frame_flow_dir, cam_name + ".npy")
+            if not os.path.exists(flow_path):
+                continue
+            flow = np.load(flow_path)   # (Hf, Wf, 2)  values in flow-image coords
+            Hf, Wf = flow.shape[:2]
+            H_cam, W_cam = c["height"], c["width"]
+
+            # W2C matrix
+            R, T = c["R"], c["T"]
+            # COLMAP convention: R is world←cam rotation (R^T is cam←world)
+            # T is cam translation in world coords (applied as p_cam = R^T p_world - R^T T)
+            # Actually in COLMAP: p_cam = R^T @ (p_world - T) where T = camera center in world
+            # But dataset_readers stores R = transpose(qvec2rotmat) and T = tvec (not center).
+            # So: p_cam = R.T @ p_world + T  (standard COLMAP w2c)
+            Rc = R.T               # (3,3) cam←world rotation
+            Tc = T                 # (3,)  translation part of w2c
+
+            pts_cam = (Rc @ pts.T).T + Tc   # (M, 3)
+
+            # Only points in front of camera
+            z = pts_cam[:, 2]
+            valid = z > 0.01
+            if not np.any(valid):
+                continue
+
+            # Project to pixel (using full-res intrinsics)
+            u0 = (pts_cam[valid, 0] / z[valid]) * c["fx"] + c["cx"]
+            v0 = (pts_cam[valid, 1] / z[valid]) * c["fy"] + c["cy"]
+
+            # Scale to flow image resolution
+            scale_u = Wf / W_cam
+            scale_v = Hf / H_cam
+            uf = u0 * scale_u
+            vf = v0 * scale_v
+
+            # Clip to flow image bounds
+            in_bounds = (uf >= 0) & (uf < Wf - 1) & (vf >= 0) & (vf < Hf - 1)
+            if not np.any(in_bounds):
+                continue
+
+            valid_idx = np.where(valid)[0][in_bounds]  # indices into pts
+            uf_valid = uf[in_bounds]
+            vf_valid = vf[in_bounds]
+
+            # Bilinear sample flow
+            ui = uf_valid.astype(np.int32)
+            vi = vf_valid.astype(np.int32)
+            du = uf_valid - ui
+            dv = vf_valid - vi
+            # flow is (Hf, Wf, 2): [delta_u_in_flow_coords, delta_v_in_flow_coords]
+            f00 = flow[vi,   ui  ]   # (K, 2)
+            f10 = flow[vi+1, ui  ]
+            f01 = flow[vi,   ui+1]
+            f11 = flow[vi+1, ui+1]
+            flow_uv = (f00 * (1-du[:,None]) * (1-dv[:,None])
+                     + f01 * (1-dv[:,None]) * du[:,None]
+                     + f10 * dv[:,None]     * (1-du[:,None])
+                     + f11 * dv[:,None]     * du[:,None])  # (K, 2)
+
+            # Convert flow from flow-image coords to full-res pixel coords
+            flow_u_px = flow_uv[:, 0] / scale_u
+            flow_v_px = flow_uv[:, 1] / scale_v
+
+            # Pixel coords at frame f+1
+            u1 = u0[in_bounds] + flow_u_px
+            v1 = v0[in_bounds] + flow_v_px
+
+            # Unproject both pixels at depth=1 → direction in camera space
+            inv_fx, inv_fy = 1.0 / c["fx"], 1.0 / c["fy"]
+            dir0 = np.stack([(u0[in_bounds] - c["cx"]) * inv_fx,
+                             (v0[in_bounds] - c["cy"]) * inv_fy,
+                             np.ones(len(u1))], axis=1)   # (K, 3)
+            dir1 = np.stack([(u1 - c["cx"]) * inv_fx,
+                             (v1 - c["cy"]) * inv_fy,
+                             np.ones(len(u1))], axis=1)   # (K, 3)
+
+            # Scale directions by actual depth so displacement is metric
+            depth = z[valid][in_bounds]
+            dir0 *= depth[:, None]
+            dir1 *= depth[:, None]
+
+            # Displacement in camera space → world space (rotation only, no translation)
+            Rw = Rc.T    # world←cam
+            disp_world = (Rw @ (dir1 - dir0).T).T   # (K, 3)
+
+            vel_world = disp_world / delta_t
+            vel_sum[valid_idx] += vel_world
+            vel_cnt[valid_idx] += 1
+
+        has_est = vel_cnt > 0
+        velocities[mask] = np.where(has_est[:, None],
+                                    (vel_sum / np.maximum(vel_cnt[:, None], 1)).astype(np.float32),
+                                    0.0)
+        n_est = int(has_est.sum())
+        print(f"[flow-vel] frame {f}: {M} pts, {n_est} got flow estimate "
+              f"({M - n_est} zero-init)")
+
+    return velocities
+
 
 def _read_colmap_calib(path):
     """Read COLMAP camera calibration without opening any images.

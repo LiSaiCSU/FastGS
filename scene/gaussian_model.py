@@ -273,7 +273,15 @@ class GaussianModel:
         sigma_t_raw = torch.empty(N, device="cuda")
         sigma_t_raw[is_static] = math.log(1000.0)
         sigma_t_raw[~is_static] = math.log(2.5 / max(self.n_frames, 1))
-        velocity = torch.zeros((N, 3), device="cuda")
+
+        # Use flow-estimated velocities if available, otherwise zero-init.
+        vel_np = getattr(tpcd, "velocities", None)
+        if vel_np is not None and np.asarray(vel_np).shape == (N, 3):
+            velocity = torch.tensor(np.asarray(vel_np), dtype=torch.float, device="cuda")
+            print(f"[TD-FastGS] initialising velocity from optical flow "
+                  f"(nonzero: {int((velocity.norm(dim=1) > 1e-6).sum())}/{N})")
+        else:
+            velocity = torch.zeros((N, 3), device="cuda")
 
         self.is_static = is_static
         self._t_mu = t_mu
